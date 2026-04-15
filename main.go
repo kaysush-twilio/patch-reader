@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,8 +17,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/kaysush-twilio/patch-reader/internal/avro"
-	"github.com/manifoldco/promptui"
 )
 
 const (
@@ -30,12 +32,219 @@ type Result struct {
 	PK       string
 	SK       string
 	AvroData []byte
-	Patch    *avro.ProfileIdentifierPatch // Deserialized for display
+	Patch    *avro.ProfileIdentifierPatch
 }
 
 type QueryJob struct {
 	N  int
 	PK string
+}
+
+// Styles
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("205")).
+			MarginBottom(1)
+
+	selectedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("229")).
+			Background(lipgloss.Color("57")).
+			Bold(true)
+
+	normalStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	dimStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241"))
+
+	jsonStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("115"))
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241")).
+			MarginTop(1)
+
+	borderStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(0, 1)
+)
+
+// TUI Model
+type model struct {
+	results      []*Result
+	cursor       int
+	scrollOffset int
+	viewHeight   int
+	jsonScroll   int
+	jsonLines    []string
+	quitting     bool
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.quitting = true
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.jsonScroll = 0
+				m.updateJSON()
+				if m.cursor < m.scrollOffset {
+					m.scrollOffset = m.cursor
+				}
+			}
+		case "down", "j":
+			if m.cursor < len(m.results)-1 {
+				m.cursor++
+				m.jsonScroll = 0
+				m.updateJSON()
+				if m.cursor >= m.scrollOffset+m.viewHeight {
+					m.scrollOffset = m.cursor - m.viewHeight + 1
+				}
+			}
+		case "pgup":
+			m.jsonScroll -= 10
+			if m.jsonScroll < 0 {
+				m.jsonScroll = 0
+			}
+		case "pgdown":
+			m.jsonScroll += 10
+			maxScroll := len(m.jsonLines) - 20
+			if maxScroll < 0 {
+				maxScroll = 0
+			}
+			if m.jsonScroll > maxScroll {
+				m.jsonScroll = maxScroll
+			}
+		case "home":
+			m.cursor = 0
+			m.scrollOffset = 0
+			m.jsonScroll = 0
+			m.updateJSON()
+		case "end":
+			m.cursor = len(m.results) - 1
+			m.jsonScroll = 0
+			m.updateJSON()
+			if m.cursor >= m.viewHeight {
+				m.scrollOffset = m.cursor - m.viewHeight + 1
+			}
+		case "enter":
+			// Output current selection and exit
+			m.quitting = true
+			return m, tea.Quit
+		}
+	case tea.WindowSizeMsg:
+		m.viewHeight = min(10, len(m.results))
+	}
+	return m, nil
+}
+
+func (m *model) updateJSON() {
+	if m.cursor >= 0 && m.cursor < len(m.results) {
+		result := m.results[m.cursor]
+		if result.Patch != nil {
+			jsonData, _ := json.MarshalIndent(result.Patch, "", "  ")
+			m.jsonLines = strings.Split(string(jsonData), "\n")
+		} else {
+			m.jsonLines = []string{"(Unable to deserialize)"}
+		}
+	}
+}
+
+func (m model) View() string {
+	if m.quitting {
+		return ""
+	}
+
+	var b strings.Builder
+
+	// Title
+	b.WriteString(titleStyle.Render(fmt.Sprintf("Patches (%d found) - Navigate: ↑/↓  Scroll JSON: PgUp/PgDn  Select: Enter  Quit: q/Ctrl+C", len(m.results))))
+	b.WriteString("\n\n")
+
+	// Patch list
+	listLines := []string{}
+	for i, r := range m.results {
+		if i < m.scrollOffset || i >= m.scrollOffset+m.viewHeight {
+			continue
+		}
+
+		line := formatPatchLine(r)
+		if i == m.cursor {
+			listLines = append(listLines, selectedStyle.Render("▸ "+line))
+		} else {
+			listLines = append(listLines, normalStyle.Render("  "+line))
+		}
+	}
+	b.WriteString(strings.Join(listLines, "\n"))
+
+	// Scroll indicator
+	if len(m.results) > m.viewHeight {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  ... showing %d-%d of %d", m.scrollOffset+1, min(m.scrollOffset+m.viewHeight, len(m.results)), len(m.results))))
+	}
+
+	b.WriteString("\n\n")
+
+	// JSON preview
+	b.WriteString(dimStyle.Render("─── JSON Preview ───────────────────────────────────────────────────────────────"))
+	b.WriteString("\n")
+
+	// Show JSON with scroll
+	jsonViewHeight := 25
+	endLine := min(m.jsonScroll+jsonViewHeight, len(m.jsonLines))
+	visibleLines := m.jsonLines[m.jsonScroll:endLine]
+
+	for _, line := range visibleLines {
+		b.WriteString(jsonStyle.Render(line))
+		b.WriteString("\n")
+	}
+
+	// JSON scroll indicator
+	if len(m.jsonLines) > jsonViewHeight {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("... lines %d-%d of %d (PgUp/PgDn to scroll)", m.jsonScroll+1, endLine, len(m.jsonLines))))
+	}
+
+	return b.String()
+}
+
+func formatPatchLine(r *Result) string {
+	if r.Patch != nil {
+		ts := formatTimestamp(r.Patch.AcceptedAt)
+		event := r.Patch.Event.Name
+		if event == "" {
+			event = "unknown"
+		}
+		if len(event) > 25 {
+			event = event[:22] + "..."
+		}
+		summary := string(r.Patch.Summary)
+		return fmt.Sprintf("%-45s │ %s │ %-25s │ %s", r.SK, ts, event, summary)
+	}
+	return r.SK
+}
+
+func formatTimestamp(ts int64) string {
+	if ts == 0 {
+		return "N/A                "
+	}
+	t := time.UnixMilli(ts)
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
@@ -58,34 +267,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Get specific patch\n")
 		fmt.Fprintf(os.Stderr, "  %s -profile-id mem_profile_01abc -store-id mem_store_01xyz -patch-key mem_patch_01def\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # List all patches for a profile (interactive selector)\n")
+		fmt.Fprintf(os.Stderr, "  # Interactive browser - navigate patches, see JSON live\n")
 		fmt.Fprintf(os.Stderr, "  %s -profile-id mem_profile_01abc -store-id mem_store_01xyz\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  # Output all patches as JSON array\n")
 		fmt.Fprintf(os.Stderr, "  %s -profile-id mem_profile_01abc -store-id mem_store_01xyz -all\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # With AWS profile\n")
-		fmt.Fprintf(os.Stderr, "  %s -profile-id mem_profile_01abc -store-id mem_store_01xyz -aws-profile memora-dev-admin\n", os.Args[0])
 	}
 
 	flag.Parse()
 
-	// Validate required flags
 	if *profileID == "" || *storeID == "" {
 		fmt.Fprintln(os.Stderr, "Error: -profile-id and -store-id are required")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Set AWS_PROFILE if specified
 	if *awsProfile != "" {
 		os.Setenv("AWS_PROFILE", *awsProfile)
 	}
 
-	// Build table name based on environment
 	tableName := buildTableName(*env, *region, *cell)
-
 	ctx := context.Background()
 
-	// Load AWS config
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load AWS config: %v\n", err)
@@ -115,25 +317,41 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "\nFound %d patch(es)\n\n", len(results))
+	fmt.Fprintf(os.Stderr, "Found %d patch(es)\n\n", len(results))
 
-	// Single result - output directly
-	if len(results) == 1 {
+	// Single result or specific patch key - output directly
+	if len(results) == 1 || *patchKey != "" {
 		outputResult(results[0], *raw)
 		return
 	}
 
-	// Multiple results
+	// Multiple results with -all flag
 	if *all {
-		// Output all as JSON array
 		outputAllResults(results, *raw)
 		return
 	}
 
-	// Interactive selection
-	selected := interactiveSelect(results)
-	if selected != nil {
-		outputResult(selected, *raw)
+	// Interactive TUI
+	m := model{
+		results:    results,
+		cursor:     0,
+		viewHeight: min(10, len(results)),
+	}
+	m.updateJSON()
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	finalModel, err := p.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)
+		os.Exit(1)
+	}
+
+	// If user pressed Enter, output the selected patch
+	fm := finalModel.(model)
+	if fm.cursor >= 0 && fm.cursor < len(fm.results) {
+		// Check if they quit with 'q' or selected with Enter
+		// We output the selected item
+		outputResult(fm.results[fm.cursor], *raw)
 	}
 }
 
@@ -143,9 +361,8 @@ func buildTableName(env, region, cell string) string {
 
 func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profileID, storeID, patchKey string) ([]*Result, error) {
 	jobs := make(chan QueryJob, (maxN + 1))
-	resultsChan := make(chan *Result, (maxN+1)*10) // Buffer for multiple results per PK
+	resultsChan := make(chan *Result, (maxN+1)*10)
 
-	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -160,7 +377,6 @@ func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profil
 		}()
 	}
 
-	// Send jobs
 	go func() {
 		for n := 0; n <= maxN; n++ {
 			pk := fmt.Sprintf("%d%s#%s", n, profileID, storeID)
@@ -169,19 +385,16 @@ func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profil
 		close(jobs)
 	}()
 
-	// Wait for workers and close results
 	go func() {
 		wg.Wait()
 		close(resultsChan)
 	}()
 
-	// Collect all results
 	var results []*Result
 	for r := range resultsChan {
 		results = append(results, r)
 	}
 
-	// Sort by acceptedAt timestamp (newest first)
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Patch != nil && results[j].Patch != nil {
 			return results[i].Patch.AcceptedAt > results[j].Patch.AcceptedAt
@@ -196,7 +409,6 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 	var input *dynamodb.QueryInput
 
 	if patchKey != "" {
-		// Query with specific SK
 		input = &dynamodb.QueryInput{
 			TableName:              aws.String(tableName),
 			KeyConditionExpression: aws.String("PK = :pk AND SK = :sk"),
@@ -206,7 +418,6 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 			},
 		}
 	} else {
-		// Query all items for this PK
 		input = &dynamodb.QueryInput{
 			TableName:              aws.String(tableName),
 			KeyConditionExpression: aws.String("PK = :pk"),
@@ -218,7 +429,6 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 
 	output, err := client.Query(ctx, input)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[N=%d] ERROR: %v\n", job.N, err)
 		return nil
 	}
 
@@ -250,7 +460,6 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 			AvroData: avroDataBinary.Value,
 		}
 
-		// Pre-deserialize for display purposes
 		if patch, err := deserializeAvro(avroDataBinary.Value); err == nil {
 			result.Patch = patch
 		}
@@ -268,84 +477,6 @@ func deserializeAvro(data []byte) (*avro.ProfileIdentifierPatch, error) {
 		return nil, err
 	}
 	return &patch, nil
-}
-
-func formatTimestamp(ts int64) string {
-	if ts == 0 {
-		return "N/A"
-	}
-	t := time.UnixMilli(ts)
-	return t.Format("2006-01-02 15:04:05")
-}
-
-func interactiveSelect(results []*Result) *Result {
-	// Build display items
-	type displayItem struct {
-		Label  string
-		Result *Result
-	}
-
-	items := make([]displayItem, len(results))
-	for i, r := range results {
-		label := r.SK
-		if r.Patch != nil {
-			ts := formatTimestamp(r.Patch.AcceptedAt)
-			event := r.Patch.Event.Name
-			if event == "" {
-				event = "unknown"
-			}
-			summary := string(r.Patch.Summary)
-			label = fmt.Sprintf("%s | %s | %s | %s", r.SK, ts, event, summary)
-		}
-		items[i] = displayItem{Label: label, Result: r}
-	}
-
-	templates := &promptui.SelectTemplates{
-		Label:    "{{ . }}",
-		Active:   "\U0001F449 {{ .Label | cyan }}",
-		Inactive: "   {{ .Label | white }}",
-		Selected: "\U00002705 {{ .Label | green }}",
-		Details: `
---------- Patch Details ----------
-{{ "SK:" | faint }}	{{ .Result.SK }}
-{{ "PK:" | faint }}	{{ .Result.PK }}
-{{- if .Result.Patch }}
-{{ "Event:" | faint }}	{{ .Result.Patch.Event.Name }}
-{{ "Summary:" | faint }}	{{ .Result.Patch.Summary }}
-{{ "AcceptedAt:" | faint }}	{{ .Result.Patch.AcceptedAt }}
-{{ "Identifiers:" | faint }}	{{ len .Result.Patch.Identifiers }}
-{{ "Merges:" | faint }}	{{ len .Result.Patch.Merges }}
-{{- end }}`,
-	}
-
-	searcher := func(input string, index int) bool {
-		item := items[index]
-		return contains(item.Label, input)
-	}
-
-	prompt := promptui.Select{
-		Label:     "Select a patch (use arrow keys, type to search, enter to select):",
-		Items:     items,
-		Templates: templates,
-		Size:      15,
-		Searcher:  searcher,
-	}
-
-	idx, _, err := prompt.Run()
-	if err != nil {
-		if err == promptui.ErrInterrupt {
-			fmt.Fprintln(os.Stderr, "Selection cancelled")
-			os.Exit(0)
-		}
-		fmt.Fprintf(os.Stderr, "Selection failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	return items[idx].Result
-}
-
-func contains(s, substr string) bool {
-	return bytes.Contains(bytes.ToLower([]byte(s)), bytes.ToLower([]byte(substr)))
 }
 
 func outputResult(result *Result, raw bool) {
@@ -375,14 +506,12 @@ func outputResult(result *Result, raw bool) {
 
 func outputAllResults(results []*Result, raw bool) {
 	if raw {
-		// Output each base64 on its own line
 		for _, r := range results {
 			fmt.Println(base64.StdEncoding.EncodeToString(r.AvroData))
 		}
 		return
 	}
 
-	// Collect all patches
 	var patches []*avro.ProfileIdentifierPatch
 	for _, r := range results {
 		patch := r.Patch
@@ -390,7 +519,6 @@ func outputAllResults(results []*Result, raw bool) {
 			var err error
 			patch, err = deserializeAvro(r.AvroData)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Failed to deserialize patch %s: %v\n", r.SK, err)
 				continue
 			}
 		}
