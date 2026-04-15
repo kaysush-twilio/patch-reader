@@ -185,7 +185,14 @@ func (m model) View() string {
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString(dimStyle.Render(help))
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(" ─────────────────────────────────────────────────────────────────────────────────"))
+	b.WriteString(dimStyle.Render(" ─────────────────────────────────────────────────────────────────────────────────────────────────────────"))
+	b.WriteString("\n")
+
+	// Table header
+	header := fmt.Sprintf("   %-45s │ %-19s │ %-25s │ %s", "Patch Key", "Timestamp", "Event", "Summary")
+	b.WriteString(dimStyle.Render(header))
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(" ──────────────────────────────────────────────┼─────────────────────┼───────────────────────────┼─────────"))
 	b.WriteString("\n")
 
 	// Patch list
