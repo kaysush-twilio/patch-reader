@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          mkdir -p build
+
+          # Linux
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" -o build/patch-reader-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" -o build/patch-reader-linux-arm64 .
+
+          # macOS
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" -o build/patch-reader-darwin-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" -o build/patch-reader-darwin-arm64 .
+
+          # Windows
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" -o build/patch-reader-windows-amd64.exe .
+
+      - name: Create checksums
+        run: |
+          cd build
+          sha256sum * > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/patch-reader-linux-amd64
+            build/patch-reader-linux-arm64
+            build/patch-reader-darwin-amd64
+            build/patch-reader-darwin-arm64
+            build/patch-reader-windows-amd64.exe
+            build/checksums.txt
+          generate_release_notes: true
