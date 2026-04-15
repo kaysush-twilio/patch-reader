@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kaysush-twilio/patch-reader/internal/avro"
@@ -247,6 +249,89 @@ func min(a, b int) int {
 	return b
 }
 
+// validateAWSCredentials checks if AWS credentials are valid and provides helpful error messages
+func validateAWSCredentials(ctx context.Context, cfg aws.Config, profile string) error {
+	stsClient := sts.NewFromConfig(cfg)
+
+	_, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return formatAWSError(err, profile)
+	}
+
+	return nil
+}
+
+// formatAWSError provides user-friendly error messages for common AWS errors
+func formatAWSError(err error, profile string) error {
+	errStr := err.Error()
+
+	// Check for common error patterns
+	switch {
+	case strings.Contains(errStr, "could not find profile") || strings.Contains(errStr, "failed to get shared config profile"):
+		return fmt.Errorf(`AWS profile "%s" not found
+
+To fix this, add the profile to ~/.aws/config:
+
+  [profile %s]
+  sso_session = twilio
+  sso_account_id = <ACCOUNT_ID>
+  sso_role_name = Standard_PowerUser
+  region = us-east-1
+
+Then run: aws sso login --sso-session twilio`, profile, profile)
+
+	case strings.Contains(errStr, "Token has expired"):
+		return fmt.Errorf(`AWS SSO token has expired
+
+To fix this, run:
+  aws sso login --sso-session twilio`)
+
+	case strings.Contains(errStr, "refresh failed"):
+		return fmt.Errorf(`AWS SSO token refresh failed
+
+To fix this, run:
+  aws sso login --sso-session twilio`)
+
+	case strings.Contains(errStr, "InvalidGrantException") ||
+		strings.Contains(errStr, "refresh cached SSO token failed"):
+		return fmt.Errorf(`AWS SSO token is invalid or expired
+
+To fix this, run:
+  aws sso login --sso-session twilio`)
+
+	case strings.Contains(errStr, "no EC2 IMDS role found") ||
+		strings.Contains(errStr, "failed to refresh cached credentials") ||
+		strings.Contains(errStr, "failed to retrieve credentials"):
+		return fmt.Errorf(`No valid AWS credentials found
+
+To fix this, login via SSO:
+  aws sso login --sso-session twilio`)
+
+	case strings.Contains(errStr, "AccessDenied") || strings.Contains(errStr, "not authorized"):
+		return fmt.Errorf(`Access denied - your AWS profile "%s" doesn't have permission
+
+Check that your profile has access to the DynamoDB IdentityPatch tables.
+Contact your admin if you need access.`, profile)
+
+	case strings.Contains(errStr, "ResourceNotFoundException"):
+		return fmt.Errorf(`DynamoDB table not found
+
+The table may not exist in this environment/region. Check:
+  - Environment (-env): dev, stage, prod
+  - Region (-region): us-east-1, etc.
+  - Cell (-cell): cell-1, etc.`)
+
+	case strings.Contains(errStr, "UnrecognizedClientException"):
+		return fmt.Errorf(`Invalid AWS credentials
+
+Your credentials may be malformed or from the wrong account.
+Try re-authenticating: aws sso login --sso-session twilio`)
+
+	default:
+		return fmt.Errorf("AWS error: %v", err)
+	}
+}
+
 func main() {
 	// CLI flags
 	profileID := flag.String("profile-id", "", "Profile ID (required)")
@@ -281,6 +366,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Determine which profile we're using
+	activeProfile := *awsProfile
+	if activeProfile == "" {
+		activeProfile = os.Getenv("AWS_PROFILE")
+	}
+	if activeProfile == "" {
+		activeProfile = "default"
+	}
+
 	if *awsProfile != "" {
 		os.Setenv("AWS_PROFILE", *awsProfile)
 	}
@@ -290,9 +384,17 @@ func main() {
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load AWS config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", formatAWSError(err, activeProfile))
 		os.Exit(1)
 	}
+
+	// Validate AWS credentials before proceeding
+	fmt.Fprintf(os.Stderr, "Validating AWS credentials (profile: %s)...\n", activeProfile)
+	if err := validateAWSCredentials(ctx, cfg, activeProfile); err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "Credentials valid.\n\n")
 
 	client := dynamodb.NewFromConfig(cfg)
 
@@ -362,14 +464,23 @@ func buildTableName(env, region, cell string) string {
 func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profileID, storeID, patchKey string) ([]*Result, error) {
 	jobs := make(chan QueryJob, (maxN + 1))
 	resultsChan := make(chan *Result, (maxN+1)*10)
+	errChan := make(chan error, concurrency)
 
 	var wg sync.WaitGroup
+	var errOnce sync.Once // Only capture first error
+
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				queryResults := queryPK(ctx, client, tableName, job, patchKey)
+				queryResults, err := queryPK(ctx, client, tableName, job, patchKey)
+				if err != nil {
+					errOnce.Do(func() {
+						errChan <- err
+					})
+					continue
+				}
 				for _, r := range queryResults {
 					resultsChan <- r
 				}
@@ -388,11 +499,21 @@ func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profil
 	go func() {
 		wg.Wait()
 		close(resultsChan)
+		close(errChan)
 	}()
 
 	var results []*Result
 	for r := range resultsChan {
 		results = append(results, r)
+	}
+
+	// Check for errors (non-blocking since channel might be empty)
+	select {
+	case err := <-errChan:
+		if err != nil && len(results) == 0 {
+			return nil, err
+		}
+	default:
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -405,7 +526,7 @@ func findPatches(ctx context.Context, client *dynamodb.Client, tableName, profil
 	return results, nil
 }
 
-func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job QueryJob, patchKey string) []*Result {
+func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job QueryJob, patchKey string) ([]*Result, error) {
 	var input *dynamodb.QueryInput
 
 	if patchKey != "" {
@@ -429,11 +550,19 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 
 	output, err := client.Query(ctx, input)
 	if err != nil {
-		return nil
+		// Check for specific errors that should be reported
+		errStr := err.Error()
+		if strings.Contains(errStr, "AccessDenied") ||
+			strings.Contains(errStr, "ResourceNotFoundException") ||
+			strings.Contains(errStr, "UnrecognizedClientException") {
+			return nil, errors.New(errStr)
+		}
+		// Other errors (like throttling) we can ignore for individual queries
+		return nil, nil
 	}
 
 	if len(output.Items) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var results []*Result
@@ -467,7 +596,7 @@ func queryPK(ctx context.Context, client *dynamodb.Client, tableName string, job
 		results = append(results, result)
 	}
 
-	return results
+	return results, nil
 }
 
 func deserializeAvro(data []byte) (*avro.ProfileIdentifierPatch, error) {
