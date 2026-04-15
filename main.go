@@ -46,8 +46,7 @@ type QueryJob struct {
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("205")).
-			MarginBottom(1)
+			Foreground(lipgloss.Color("205"))
 
 	selectedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("229")).
@@ -62,15 +61,6 @@ var (
 
 	jsonStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("115"))
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241")).
-			MarginTop(1)
-
-	borderStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("62")).
-			Padding(0, 1)
 )
 
 // TUI Model
@@ -184,20 +174,21 @@ func (m model) View() string {
 	}
 
 	if !m.ready {
-		return "\n\n  Loading...\n"
+		return "  Loading...\n"
 	}
 
 	var b strings.Builder
 
-	// Add top padding
+	// Title with clear top margin
+	title := fmt.Sprintf(" Patches (%d found)", len(m.results))
+	help := "  ↑/↓: Navigate  PgUp/PgDn: Scroll JSON  Enter: Select  q: Quit"
+	b.WriteString(titleStyle.Render(title))
+	b.WriteString(dimStyle.Render(help))
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(" ─────────────────────────────────────────────────────────────────────────────────"))
 	b.WriteString("\n")
 
-	// Title
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Patches (%d found) - Navigate: ↑/↓  Scroll JSON: PgUp/PgDn  Select: Enter  Quit: q/Ctrl+C", len(m.results))))
-	b.WriteString("\n\n")
-
 	// Patch list
-	listLines := []string{}
 	for i, r := range m.results {
 		if i < m.scrollOffset || i >= m.scrollOffset+m.viewHeight {
 			continue
@@ -205,46 +196,47 @@ func (m model) View() string {
 
 		line := formatPatchLine(r)
 		if i == m.cursor {
-			listLines = append(listLines, selectedStyle.Render("▸ "+line))
+			b.WriteString(selectedStyle.Render(" ▸ " + line))
 		} else {
-			listLines = append(listLines, normalStyle.Render("  "+line))
+			b.WriteString(normalStyle.Render("   " + line))
 		}
+		b.WriteString("\n")
 	}
-	b.WriteString(strings.Join(listLines, "\n"))
 
 	// Scroll indicator
 	if len(m.results) > m.viewHeight {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  ... showing %d-%d of %d", m.scrollOffset+1, min(m.scrollOffset+m.viewHeight, len(m.results)), len(m.results))))
+		b.WriteString(dimStyle.Render(fmt.Sprintf("   ... showing %d-%d of %d", m.scrollOffset+1, min(m.scrollOffset+m.viewHeight, len(m.results)), len(m.results))))
+		b.WriteString("\n")
 	}
 
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
 	// JSON preview
-	b.WriteString(dimStyle.Render("─── JSON Preview ───────────────────────────────────────────────────────────────"))
+	b.WriteString(dimStyle.Render(" ─── JSON Preview ──────────────────────────────────────────────────────────────"))
 	b.WriteString("\n")
 
 	// Show JSON with scroll
-	jsonViewHeight := 25
+	jsonViewHeight := 20
 	if len(m.jsonLines) > 0 {
 		startLine := m.jsonScroll
 		if startLine >= len(m.jsonLines) {
 			startLine = 0
-			m.jsonScroll = 0
 		}
 		endLine := min(startLine+jsonViewHeight, len(m.jsonLines))
 		visibleLines := m.jsonLines[startLine:endLine]
 
 		for _, line := range visibleLines {
-			b.WriteString(jsonStyle.Render(line))
+			b.WriteString(jsonStyle.Render(" " + line))
 			b.WriteString("\n")
 		}
 
 		// JSON scroll indicator
 		if len(m.jsonLines) > jsonViewHeight {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("... lines %d-%d of %d (PgUp/PgDn to scroll)", startLine+1, endLine, len(m.jsonLines))))
+			b.WriteString(dimStyle.Render(fmt.Sprintf(" ... lines %d-%d of %d (PgUp/PgDn to scroll)", startLine+1, endLine, len(m.jsonLines))))
+			b.WriteString("\n")
 		}
 	} else {
-		b.WriteString(jsonStyle.Render("(No data)"))
+		b.WriteString(jsonStyle.Render(" (No data)"))
 		b.WriteString("\n")
 	}
 
