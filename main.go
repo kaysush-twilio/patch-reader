@@ -75,13 +75,16 @@ var (
 
 // TUI Model
 type model struct {
-	results      []*Result
-	cursor       int
-	scrollOffset int
-	viewHeight   int
-	jsonScroll   int
-	jsonLines    []string
-	quitting     bool
+	results       []*Result
+	cursor        int
+	scrollOffset  int
+	viewHeight    int
+	jsonScroll    int
+	jsonLines     []string
+	quitting      bool
+	windowHeight  int
+	windowWidth   int
+	ready         bool
 }
 
 func (m model) Init() tea.Cmd {
@@ -90,6 +93,16 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.windowHeight = msg.Height
+		m.windowWidth = msg.Width
+		m.viewHeight = min(10, len(m.results))
+		if !m.ready {
+			m.ready = true
+			m.updateJSON()
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
@@ -144,21 +157,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-	case tea.WindowSizeMsg:
-		m.viewHeight = min(10, len(m.results))
 	}
 	return m, nil
 }
 
 func (m *model) updateJSON() {
-	if m.cursor >= 0 && m.cursor < len(m.results) {
-		result := m.results[m.cursor]
-		if result.Patch != nil {
-			jsonData, _ := json.MarshalIndent(result.Patch, "", "  ")
-			m.jsonLines = strings.Split(string(jsonData), "\n")
-		} else {
-			m.jsonLines = []string{"(Unable to deserialize)"}
-		}
+	if len(m.results) == 0 {
+		m.jsonLines = []string{"(No patches)"}
+		return
+	}
+	if m.cursor < 0 || m.cursor >= len(m.results) {
+		m.cursor = 0
+	}
+	result := m.results[m.cursor]
+	if result.Patch != nil {
+		jsonData, _ := json.MarshalIndent(result.Patch, "", "  ")
+		m.jsonLines = strings.Split(string(jsonData), "\n")
+	} else {
+		m.jsonLines = []string{"(Unable to deserialize Avro data)"}
 	}
 }
 
@@ -167,7 +183,14 @@ func (m model) View() string {
 		return ""
 	}
 
+	if !m.ready {
+		return "\n\n  Loading...\n"
+	}
+
 	var b strings.Builder
+
+	// Add top padding
+	b.WriteString("\n")
 
 	// Title
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Patches (%d found) - Navigate: ↑/↓  Scroll JSON: PgUp/PgDn  Select: Enter  Quit: q/Ctrl+C", len(m.results))))
@@ -202,17 +225,27 @@ func (m model) View() string {
 
 	// Show JSON with scroll
 	jsonViewHeight := 25
-	endLine := min(m.jsonScroll+jsonViewHeight, len(m.jsonLines))
-	visibleLines := m.jsonLines[m.jsonScroll:endLine]
+	if len(m.jsonLines) > 0 {
+		startLine := m.jsonScroll
+		if startLine >= len(m.jsonLines) {
+			startLine = 0
+			m.jsonScroll = 0
+		}
+		endLine := min(startLine+jsonViewHeight, len(m.jsonLines))
+		visibleLines := m.jsonLines[startLine:endLine]
 
-	for _, line := range visibleLines {
-		b.WriteString(jsonStyle.Render(line))
+		for _, line := range visibleLines {
+			b.WriteString(jsonStyle.Render(line))
+			b.WriteString("\n")
+		}
+
+		// JSON scroll indicator
+		if len(m.jsonLines) > jsonViewHeight {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("... lines %d-%d of %d (PgUp/PgDn to scroll)", startLine+1, endLine, len(m.jsonLines))))
+		}
+	} else {
+		b.WriteString(jsonStyle.Render("(No data)"))
 		b.WriteString("\n")
-	}
-
-	// JSON scroll indicator
-	if len(m.jsonLines) > jsonViewHeight {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("... lines %d-%d of %d (PgUp/PgDn to scroll)", m.jsonScroll+1, endLine, len(m.jsonLines))))
 	}
 
 	return b.String()
@@ -438,8 +471,8 @@ func main() {
 		results:    results,
 		cursor:     0,
 		viewHeight: min(10, len(results)),
+		ready:      false,
 	}
-	m.updateJSON()
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	finalModel, err := p.Run()
